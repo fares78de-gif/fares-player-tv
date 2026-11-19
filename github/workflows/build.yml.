@@ -1,0 +1,420 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Generate project
+        run: |
+          mkdir proj && cd proj
+          mkdir -p app
+          cat > app/build.gradle.kts <<'FARES_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.fares.playertv"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.fares.playertv"
+                  minSdk = 21
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              buildTypes {
+                  release {
+                      isMinifyEnabled = true
+                      isShrinkResources = true
+                      proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+                      signingConfig = signingConfigs.getByName("debug")
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation("androidx.media3:media3-exoplayer:1.4.1")
+              implementation("androidx.media3:media3-exoplayer-hls:1.4.1")
+              implementation("androidx.media3:media3-ui:1.4.1")
+              implementation("androidx.recyclerview:recyclerview:1.3.2")
+          }
+          FARES_EOF
+          mkdir -p app
+          cat > app/proguard-rules.pro <<'FARES_EOF'
+          -dontwarn **
+          FARES_EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'FARES_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+              <uses-feature android:name="android.software.leanback" android:required="false" />
+              <application
+                  android:label="@string/app_name"
+                  android:icon="@drawable/banner"
+                  android:banner="@drawable/banner"
+                  android:usesCleartextTraffic="true"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                          <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <activity android:name=".BrowseActivity" />
+                  <activity android:name=".PlayerActivity" android:configChanges="orientation|screenSize|keyboardHidden" />
+              </application>
+          </manifest>
+          FARES_EOF
+          mkdir -p app/src/main/java/com/fares/playertv
+          cat > app/src/main/java/com/fares/playertv/BrowseActivity.kt <<'FARES_EOF'
+          package com.fares.playertv
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.os.Bundle
+          import android.widget.Toast
+          import androidx.recyclerview.widget.LinearLayoutManager
+          import androidx.recyclerview.widget.RecyclerView
+
+          class BrowseActivity : Activity() {
+              private lateinit var acc: Account
+              private var cats: List<Pair<String?, String>> = emptyList()
+              private var chans: List<Channel> = emptyList()
+              private lateinit var chAdapter: RowAdapter
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  setContentView(R.layout.activity_browse)
+                  acc = Account(intent.getStringExtra("s")!!, intent.getStringExtra("u")!!, intent.getStringExtra("p")!!)
+
+                  chAdapter = RowAdapter(emptyList(), { i ->
+                      Playlist.items = chans; Playlist.index = i
+                      startActivity(Intent(this, PlayerActivity::class.java))
+                  })
+                  val rvCh = findViewById<RecyclerView>(R.id.rvChannels)
+                  rvCh.layoutManager = LinearLayoutManager(this); rvCh.adapter = chAdapter
+
+                  val catAdapter = RowAdapter(emptyList(), { i -> loadChannels(cats[i].first) })
+                  val rvCat = findViewById<RecyclerView>(R.id.rvCats)
+                  rvCat.layoutManager = LinearLayoutManager(this); rvCat.adapter = catAdapter
+
+                  Thread {
+                      try {
+                          val c = listOf<Pair<String?, String>>(null to "All channels") + Xtream.categories(acc)
+                          runOnUiThread { cats = c; catAdapter.items = c.map { it.second }; catAdapter.notifyDataSetChanged() }
+                      } catch (e: Exception) { toast("Login/server error: ${e.message}") }
+                  }.start()
+              }
+
+              private fun loadChannels(cat: String?) {
+                  Thread {
+                      try {
+                          val l = Xtream.channels(acc, cat)
+                          runOnUiThread { chans = l; chAdapter.items = l.map { it.name }; chAdapter.notifyDataSetChanged() }
+                      } catch (e: Exception) { toast("Error: ${e.message}") }
+                  }.start()
+              }
+
+              private fun toast(m: String) = runOnUiThread { Toast.makeText(this, m, Toast.LENGTH_LONG).show() }
+          }
+          FARES_EOF
+          mkdir -p app/src/main/java/com/fares/playertv
+          cat > app/src/main/java/com/fares/playertv/MainActivity.kt <<'FARES_EOF'
+          package com.fares.playertv
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.os.Bundle
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.Toast
+          import androidx.recyclerview.widget.LinearLayoutManager
+          import androidx.recyclerview.widget.RecyclerView
+
+          class MainActivity : Activity() {
+              private lateinit var accounts: MutableList<Account>
+              private lateinit var adapter: RowAdapter
+
+              private fun labels() = accounts.map { "${it.user}  @  ${it.server}" }
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  setContentView(R.layout.activity_main)
+                  accounts = Store.load(this)
+                  adapter = RowAdapter(labels(), { i ->
+                      val a = accounts[i]
+                      startActivity(Intent(this, BrowseActivity::class.java)
+                          .putExtra("s", a.server).putExtra("u", a.user).putExtra("p", a.pass))
+                  }, { i ->
+                      accounts.removeAt(i); Store.save(this, accounts)
+                      adapter.items = labels(); adapter.notifyDataSetChanged()
+                  })
+                  findViewById<RecyclerView>(R.id.rvAccounts).apply {
+                      layoutManager = LinearLayoutManager(this@MainActivity); adapter = this@MainActivity.adapter
+                  }
+                  findViewById<Button>(R.id.btnAdd).setOnClickListener {
+                      val s = findViewById<EditText>(R.id.etServer).text.toString()
+                      val u = findViewById<EditText>(R.id.etUser).text.toString().trim()
+                      val p = findViewById<EditText>(R.id.etPass).text.toString().trim()
+                      if (s.isBlank() || u.isEmpty() || p.isEmpty()) {
+                          Toast.makeText(this, "Fill all fields", Toast.LENGTH_SHORT).show(); return@setOnClickListener
+                      }
+                      accounts.add(Account(Xtream.normalize(s), u, p)); Store.save(this, accounts)
+                      adapter.items = labels(); adapter.notifyDataSetChanged()
+                      listOf(R.id.etServer, R.id.etUser, R.id.etPass).forEach { findViewById<EditText>(it).setText("") }
+                  }
+              }
+          }
+          FARES_EOF
+          mkdir -p app/src/main/java/com/fares/playertv
+          cat > app/src/main/java/com/fares/playertv/PlayerActivity.kt <<'FARES_EOF'
+          package com.fares.playertv
+
+          import android.app.Activity
+          import android.os.Bundle
+          import android.view.KeyEvent
+          import android.view.WindowManager
+          import android.widget.Toast
+          import androidx.media3.common.MediaItem
+          import androidx.media3.common.PlaybackException
+          import androidx.media3.common.Player
+          import androidx.media3.exoplayer.ExoPlayer
+          import androidx.media3.ui.PlayerView
+
+          class PlayerActivity : Activity() {
+              private var player: ExoPlayer? = null
+              private lateinit var view: PlayerView
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  view = PlayerView(this).apply { useController = false }
+                  setContentView(view)
+                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+              }
+
+              override fun onStart() {
+                  super.onStart()
+                  player = ExoPlayer.Builder(this).build().also {
+                      view.player = it
+                      it.addListener(object : Player.Listener {
+                          override fun onPlayerError(e: PlaybackException) {
+                              Toast.makeText(this@PlayerActivity, "Playback error: ${e.errorCodeName}", Toast.LENGTH_LONG).show()
+                          }
+                      })
+                  }
+                  play(Playlist.index)
+              }
+
+              private fun play(i: Int) {
+                  val l = Playlist.items
+                  if (l.isEmpty()) return
+                  val n = (i + l.size) % l.size
+                  Playlist.index = n
+                  player?.apply { setMediaItem(MediaItem.fromUri(l[n].url)); prepare(); playWhenReady = true }
+                  Toast.makeText(this, l[n].name, Toast.LENGTH_SHORT).show()
+              }
+
+              override fun dispatchKeyEvent(e: KeyEvent): Boolean {
+                  if (e.action == KeyEvent.ACTION_DOWN) when (e.keyCode) {
+                      KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_CHANNEL_UP -> { play(Playlist.index + 1); return true }
+                      KeyEvent.KEYCODE_DPAD_DOWN, KeyEvent.KEYCODE_CHANNEL_DOWN -> { play(Playlist.index - 1); return true }
+                      KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> {
+                          player?.let { it.playWhenReady = !it.playWhenReady }; return true
+                      }
+                  }
+                  return super.dispatchKeyEvent(e)
+              }
+
+              override fun onStop() {
+                  super.onStop()
+                  player?.release(); player = null
+              }
+          }
+          FARES_EOF
+          mkdir -p app/src/main/java/com/fares/playertv
+          cat > app/src/main/java/com/fares/playertv/Util.kt <<'FARES_EOF'
+          package com.fares.playertv
+
+          import android.content.Context
+          import android.net.Uri
+          import android.view.LayoutInflater
+          import android.view.ViewGroup
+          import android.widget.TextView
+          import androidx.recyclerview.widget.RecyclerView
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.net.HttpURLConnection
+          import java.net.URL
+
+          data class Account(val server: String, val user: String, val pass: String)
+          data class Channel(val name: String, val url: String)
+
+          object Playlist { var items: List<Channel> = emptyList(); var index = 0 }
+
+          object Store {
+              fun load(c: Context): MutableList<Account> {
+                  val s = c.getSharedPreferences("p", 0).getString("accounts", "[]")!!
+                  val a = JSONArray(s)
+                  return MutableList(a.length()) {
+                      val o = a.getJSONObject(it)
+                      Account(o.getString("s"), o.getString("u"), o.getString("p"))
+                  }
+              }
+              fun save(c: Context, l: List<Account>) {
+                  val a = JSONArray()
+                  l.forEach { a.put(JSONObject().put("s", it.server).put("u", it.user).put("p", it.pass)) }
+                  c.getSharedPreferences("p", 0).edit().putString("accounts", a.toString()).apply()
+              }
+          }
+
+          object Xtream {
+              fun normalize(s: String): String {
+                  var t = s.trim().trimEnd('/')
+                  if (!t.startsWith("http://") && !t.startsWith("https://")) t = "http://$t"
+                  return t
+              }
+              private fun get(url: String): String {
+                  val c = URL(url).openConnection() as HttpURLConnection
+                  c.connectTimeout = 15000; c.readTimeout = 30000
+                  c.setRequestProperty("User-Agent", "FaresPlayerTV/1.0")
+                  return try { c.inputStream.bufferedReader().readText() } finally { c.disconnect() }
+              }
+              private fun api(a: Account, action: String, extra: String = "") =
+                  "${a.server}/player_api.php?username=${Uri.encode(a.user)}&password=${Uri.encode(a.pass)}&action=$action$extra"
+
+              fun categories(a: Account): List<Pair<String, String>> {
+                  val j = JSONArray(get(api(a, "get_live_categories")))
+                  return List(j.length()) { j.getJSONObject(it).let { o -> o.getString("category_id") to o.getString("category_name") } }
+              }
+              fun channels(a: Account, catId: String?): List<Channel> {
+                  val extra = if (catId == null) "" else "&category_id=$catId"
+                  val j = JSONArray(get(api(a, "get_live_streams", extra)))
+                  return List(j.length()) {
+                      val o = j.getJSONObject(it)
+                      Channel(o.getString("name"),
+                          "${a.server}/live/${Uri.encode(a.user)}/${Uri.encode(a.pass)}/${o.get("stream_id")}.m3u8")
+                  }
+              }
+          }
+
+          class RowAdapter(
+              var items: List<String>,
+              val onClick: (Int) -> Unit,
+              val onLong: ((Int) -> Unit)? = null
+          ) : RecyclerView.Adapter<RowAdapter.VH>() {
+              class VH(val t: TextView) : RecyclerView.ViewHolder(t)
+              override fun onCreateViewHolder(p: ViewGroup, v: Int) =
+                  VH(LayoutInflater.from(p.context).inflate(R.layout.item_row, p, false) as TextView)
+              override fun onBindViewHolder(h: VH, i: Int) {
+                  h.t.text = items[i]
+                  h.t.setOnClickListener { onClick(h.bindingAdapterPosition) }
+                  h.t.setOnLongClickListener { onLong?.invoke(h.bindingAdapterPosition); onLong != null }
+              }
+              override fun getItemCount() = items.size
+          }
+          FARES_EOF
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/banner.xml <<'FARES_EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="320dp" android:height="180dp" android:viewportWidth="320" android:viewportHeight="180">
+              <path android:fillColor="#0B132B" android:pathData="M0,0h320v180h-320z"/>
+              <path android:fillColor="#00C2FF" android:pathData="M135,50L135,130L205,90z"/>
+          </vector>
+          FARES_EOF
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/item_bg.xml <<'FARES_EOF'
+          <selector xmlns:android="http://schemas.android.com/apk/res/android">
+              <item android:state_focused="true"><shape><solid android:color="#3A6EA5"/><corners android:radius="8dp"/></shape></item>
+              <item><shape><solid android:color="#1C2541"/><corners android:radius="8dp"/></shape></item>
+          </selector>
+          FARES_EOF
+          mkdir -p app/src/main/res/layout
+          cat > app/src/main/res/layout/activity_browse.xml <<'FARES_EOF'
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent" android:layout_height="match_parent"
+              android:orientation="horizontal" android:padding="16dp" android:background="#0B132B">
+              <androidx.recyclerview.widget.RecyclerView android:id="@+id/rvCats"
+                  android:layout_width="0dp" android:layout_height="match_parent" android:layout_weight="1"/>
+              <androidx.recyclerview.widget.RecyclerView android:id="@+id/rvChannels"
+                  android:layout_width="0dp" android:layout_height="match_parent" android:layout_weight="2"/>
+          </LinearLayout>
+          FARES_EOF
+          mkdir -p app/src/main/res/layout
+          cat > app/src/main/res/layout/activity_main.xml <<'FARES_EOF'
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent" android:layout_height="match_parent"
+              android:orientation="vertical" android:padding="32dp" android:background="#0B132B">
+              <TextView android:layout_width="wrap_content" android:layout_height="wrap_content"
+                  android:text="Fares Player TV" android:textColor="#00C2FF" android:textSize="28sp" android:textStyle="bold"/>
+              <EditText android:id="@+id/etServer" android:layout_width="match_parent" android:layout_height="wrap_content"
+                  android:hint="http://server:port" android:inputType="textUri" android:singleLine="true"
+                  android:textColor="#FFF" android:textColorHint="#8899AA"/>
+              <EditText android:id="@+id/etUser" android:layout_width="match_parent" android:layout_height="wrap_content"
+                  android:hint="Username" android:inputType="text" android:singleLine="true"
+                  android:textColor="#FFF" android:textColorHint="#8899AA"/>
+              <EditText android:id="@+id/etPass" android:layout_width="match_parent" android:layout_height="wrap_content"
+                  android:hint="Password" android:inputType="textPassword" android:singleLine="true"
+                  android:textColor="#FFF" android:textColorHint="#8899AA"/>
+              <Button android:id="@+id/btnAdd" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                  android:text="Add Xtream account"/>
+              <TextView android:layout_width="wrap_content" android:layout_height="wrap_content"
+                  android:layout_marginTop="12dp" android:text="Saved accounts (long-press to delete)"
+                  android:textColor="#8899AA"/>
+              <androidx.recyclerview.widget.RecyclerView android:id="@+id/rvAccounts"
+                  android:layout_width="match_parent" android:layout_height="0dp" android:layout_weight="1"/>
+          </LinearLayout>
+          FARES_EOF
+          mkdir -p app/src/main/res/layout
+          cat > app/src/main/res/layout/item_row.xml <<'FARES_EOF'
+          <TextView xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent" android:layout_height="wrap_content"
+              android:layout_margin="4dp" android:padding="14dp"
+              android:focusable="true" android:clickable="true"
+              android:background="@drawable/item_bg"
+              android:textColor="#FFFFFF" android:textSize="18sp"
+              android:singleLine="true" android:ellipsize="end" />
+          FARES_EOF
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'FARES_EOF'
+          <resources><string name="app_name">Fares Player TV</string></resources>
+          FARES_EOF
+          cat > build.gradle.kts <<'FARES_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          FARES_EOF
+          cat > gradle.properties <<'FARES_EOF'
+          org.gradle.jvmargs=-Xmx2048m
+          android.useAndroidX=true
+          FARES_EOF
+          cat > settings.gradle.kts <<'FARES_EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "FaresPlayerTV"
+          include(":app")
+          FARES_EOF
+      - name: Build release APK
+        working-directory: proj
+        run: gradle assembleRelease --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FaresPlayerTV-apk
+          path: proj/app/build/outputs/apk/release/*.apk
